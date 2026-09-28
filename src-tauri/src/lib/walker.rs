@@ -72,7 +72,9 @@ pub fn walk_recursive(
     let batch_queue = Arc::new(SegQueue::new());
     {
         let batch_queue = batch_queue.clone();
-        let Ok(root) = config.root() else { return ExclusionActionBatch::default() };
+        let Ok(root) = config.root() else {
+            return ExclusionActionBatch::default();
+        };
         let counter = AtomicUsize::new(0);
         WalkDirGeneric::<(_, ())>::new(root)
             .root_read_dir_state(config)
