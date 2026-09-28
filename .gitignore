@@ -7,3 +7,10 @@
 /.next
 /.vscode
 /.parcel-cache
+.claude/parallel-dev/loop-state.json
+.claude/parallel-dev/runs/
+.env
+.env.solidforge
+!.env.example
+!.env.solidforge.example
+.llm-provider.*.json
