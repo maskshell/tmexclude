@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -32,6 +33,20 @@ impl ExcludeState {
     pub fn is_excluded(&self) -> bool {
         matches!(self, Self::Excluded)
     }
+}
+
+/// Shallow per-entry snapshot used by `generate_diff`.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+struct ShallowEntry {
+    state: ExcludeState,
+    /// Whether the entry is a real directory. Captured from the entry's file type
+    /// without following symlinks, so dot-symlinks are not hidden-matched.
+    is_dir: bool,
+}
+
+/// Whether the entry name is dot-prefixed (hidden in the unix sense).
+fn is_hidden(name: &Path) -> bool {
+    name.as_os_str().as_bytes().first() == Some(&b'.')
 }
 
 fn check_f(support_dump: bool) -> fn(&Path) -> std::io::Result<ExcludeState> {
@@ -124,7 +139,8 @@ pub fn walk_recursive(
                                 entry.read_children_path = None;
                                 None
                             } else {
-                                Some((entry, check(&path).ok()?))
+                                let is_dir = entry.file_type.is_dir();
+                                Some((entry, check(&path).ok()?, is_dir))
                             }
                         })
                         .collect_vec();
@@ -132,15 +148,21 @@ pub fn walk_recursive(
                     // Generate diff.
                     let shallow_list: HashMap<_, _> = children
                         .iter()
-                        .map(|(path, excluded)| {
-                            (PathBuf::from(path.file_name().to_os_string()), *excluded)
+                        .map(|(path, state, is_dir)| {
+                            (
+                                PathBuf::from(path.file_name().to_os_string()),
+                                ShallowEntry {
+                                    state: *state,
+                                    is_dir: *is_dir,
+                                },
+                            )
                         })
                         .collect();
                     let diff = generate_diff(path, &shallow_list, &*config.directories);
                     found.fetch_add(diff.count(), Ordering::Relaxed);
 
                     // Exclude already excluded or uncovered children.
-                    for (entry, state) in children {
+                    for (entry, state, _) in children {
                         let path = entry.path();
                         if (state.is_excluded() && !diff.remove.contains(&path))
                             || diff.add.contains(&path)
@@ -221,12 +243,15 @@ pub fn walk_non_recursive(
                         // Skip this entry in all preceding procedures and scans.
                         None
                     } else {
+                        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
                         Some((
                             PathBuf::from(path.file_name().expect("file name").to_os_string()),
                             check(&path).ok()?,
+                            is_dir,
                         ))
                     }
                 })
+                .map(|(name, state, is_dir)| (name, ShallowEntry { state, is_dir }))
                 .collect();
             generate_diff(root, &shallow_list, directories)
         }
@@ -239,7 +264,7 @@ pub fn walk_non_recursive(
 
 fn generate_diff<'a, 'b>(
     cwd: &'a Path,
-    shallow_list: &'a HashMap<PathBuf, ExcludeState>,
+    shallow_list: &'a HashMap<PathBuf, ShallowEntry>,
     directories: impl IntoIterator<Item = &'b Directory>,
 ) -> ExclusionActionBatch {
     let candidate_rules: Vec<&Rule> = directories
@@ -249,16 +274,26 @@ fn generate_diff<'a, 'b>(
         .collect();
     shallow_list
         .iter()
-        .filter_map(|(name, excluded)| {
-            let expected_excluded = candidate_rules.iter().any(|rule| {
-                rule.excludes.contains(name)
-                    && (rule.if_exists.is_empty()
-                        || rule
-                            .if_exists
-                            .iter()
-                            .any(|if_exist| shallow_list.contains_key(if_exist.as_path())))
-            });
-            match (expected_excluded, *excluded) {
+        .filter_map(|(name, entry)| {
+            // `protects` vetoes Add only: a protected entry carrying a stale
+            // exclusion is still cleaned up via Remove.
+            let protected = candidate_rules
+                .iter()
+                .any(|r| r.protects.as_deref().unwrap_or(&[]).contains(name));
+            let expected_excluded = !protected
+                && candidate_rules.iter().any(|rule| {
+                    let matched = rule.excludes.contains(name)
+                        || (rule.exclude_hidden.unwrap_or(false)
+                            && entry.is_dir
+                            && is_hidden(name));
+                    matched
+                        && (rule.if_exists.is_empty()
+                            || rule
+                                .if_exists
+                                .iter()
+                                .any(|if_exist| shallow_list.contains_key(if_exist.as_path())))
+                });
+            match (expected_excluded, entry.state) {
                 (true, ExcludeState::Included | ExcludeState::Inconsistent) => {
                     Some(ExclusionAction::Add(cwd.join(name)))
                 }
@@ -269,4 +304,150 @@ fn generate_diff<'a, 'b>(
             }
         })
         .into()
+}
+
+#[cfg(test)]
+mod test {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::str::FromStr;
+
+    use super::{generate_diff, ExcludeState, ShallowEntry};
+    use crate::config::{Directory, Rule};
+    use crate::tmutil::ExclusionActionBatch;
+
+    fn rule(
+        excludes: &[&str],
+        if_exists: &[&str],
+        exclude_hidden: Option<bool>,
+        protects: &[&str],
+    ) -> Rule {
+        Rule {
+            excludes: excludes
+                .iter()
+                .map(|name| PathBuf::from_str(name).unwrap())
+                .collect(),
+            if_exists: if_exists
+                .iter()
+                .map(|name| PathBuf::from_str(name).unwrap())
+                .collect(),
+            exclude_hidden,
+            protects: Some(
+                protects
+                    .iter()
+                    .map(|name| PathBuf::from_str(name).unwrap())
+                    .collect(),
+            ),
+        }
+    }
+
+    fn shallow_list(entries: &[(&str, ExcludeState, bool)]) -> HashMap<PathBuf, ShallowEntry> {
+        entries
+            .iter()
+            .map(|(name, state, is_dir)| {
+                (
+                    PathBuf::from_str(name).unwrap(),
+                    ShallowEntry {
+                        state: *state,
+                        is_dir: *is_dir,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn generate(
+        shallow_list: &HashMap<PathBuf, ShallowEntry>,
+        rules: Vec<Rule>,
+    ) -> ExclusionActionBatch {
+        // Directory path "/" makes every rule applicable to the cwd "/".
+        generate_diff(
+            Path::new("/"),
+            shallow_list,
+            &[Directory {
+                path: PathBuf::from("/"),
+                rules,
+            }],
+        )
+    }
+
+    #[test]
+    fn hidden_dot_dir_matched() {
+        let list = shallow_list(&[(".hidden", ExcludeState::Included, true)]);
+        let batch = generate(&list, vec![rule(&[], &[], Some(true), &[])]);
+        assert_eq!(batch.add, vec![PathBuf::from("/.hidden")]);
+        assert!(batch.remove.is_empty());
+    }
+
+    #[test]
+    fn dot_file_not_matched() {
+        let list = shallow_list(&[(".hidden_file", ExcludeState::Included, false)]);
+        let batch = generate(&list, vec![rule(&[], &[], Some(true), &[])]);
+        assert!(batch.add.is_empty());
+        assert!(batch.remove.is_empty());
+    }
+
+    #[test]
+    fn dot_symlink_to_dir_not_matched() {
+        // A dot-prefixed symlink is not a real directory: `is_dir` is captured without
+        // following symlinks, so it must not be hidden-matched.
+        let list = shallow_list(&[(".link", ExcludeState::Included, false)]);
+        let batch = generate(&list, vec![rule(&[], &[], Some(true), &[])]);
+        assert!(batch.add.is_empty());
+        assert!(batch.remove.is_empty());
+    }
+
+    #[test]
+    fn protects_blocks_add_but_not_remove() {
+        let protected = rule(&["protected"], &[], None, &["protected"]);
+
+        // Protected entry without stale exclusion: never Add-ed.
+        let list = shallow_list(&[("protected", ExcludeState::Included, true)]);
+        let batch = generate(&list, vec![protected.clone()]);
+        assert!(batch.add.is_empty());
+        assert!(batch.remove.is_empty());
+
+        // Protected entry carrying a stale exclusion: Add blocked, Remove still produced.
+        let list = shallow_list(&[("protected", ExcludeState::Excluded, true)]);
+        let batch = generate(&list, vec![protected]);
+        assert!(batch.add.is_empty());
+        assert_eq!(batch.remove, vec![PathBuf::from("/protected")]);
+    }
+
+    #[test]
+    fn if_exists_gates_hidden_matching() {
+        // Marker absent: hidden matching is gated off.
+        let list = shallow_list(&[(".hidden", ExcludeState::Included, true)]);
+        let gated = rule(&[], &["marker"], Some(true), &[]);
+        let batch = generate(&list, vec![gated.clone()]);
+        assert!(batch.add.is_empty());
+        assert!(batch.remove.is_empty());
+
+        // Marker present: the dot-directory gains the exclusion.
+        let list = shallow_list(&[
+            (".hidden", ExcludeState::Included, true),
+            ("marker", ExcludeState::Included, false),
+        ]);
+        let batch = generate(&list, vec![gated]);
+        assert_eq!(batch.add, vec![PathBuf::from("/.hidden")]);
+        assert!(batch.remove.is_empty());
+    }
+
+    #[test]
+    fn hidden_disabled_never_matches() {
+        let list = shallow_list(&[(".hidden", ExcludeState::Included, true)]);
+        for exclude_hidden in [None, Some(false)] {
+            let batch = generate(&list, vec![rule(&[], &[], exclude_hidden, &[])]);
+            assert!(batch.add.is_empty());
+            assert!(batch.remove.is_empty());
+        }
+    }
+
+    #[test]
+    fn excludes_name_still_matches() {
+        // Name-based excludes keep working through the updated matching logic.
+        let list = shallow_list(&[("build", ExcludeState::Included, true)]);
+        let batch = generate(&list, vec![rule(&["build"], &[], None, &[])]);
+        assert_eq!(batch.add, vec![PathBuf::from("/build")]);
+    }
 }
