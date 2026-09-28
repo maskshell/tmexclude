@@ -202,6 +202,12 @@ pub fn walk_non_recursive(
         return ExclusionActionBatch::default();
     }
 
+    if fs::symlink_metadata(root).is_err() {
+        // The path vanished before we walked it (e.g. deleted in a storm):
+        // return an empty batch before any ancestors getxattr.
+        return ExclusionActionBatch::default();
+    }
+
     if config.skips.iter().any(|skip| root.starts_with(skip)) {
         // The directory should be skipped.
         skip_cache.insert(root.to_path_buf(), ());
@@ -308,12 +314,13 @@ fn generate_diff<'a, 'b>(
 
 #[cfg(test)]
 mod test {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
     use std::str::FromStr;
 
-    use super::{generate_diff, ExcludeState, ShallowEntry};
-    use crate::config::{Directory, Rule};
+    use super::{generate_diff, walk_non_recursive, ExcludeState, ShallowEntry};
+    use crate::config::{Directory, Rule, WalkConfig};
+    use crate::skip_cache::SkipCache;
     use crate::tmutil::ExclusionActionBatch;
 
     fn rule(
@@ -449,5 +456,26 @@ mod test {
         let list = shallow_list(&[("build", ExcludeState::Included, true)]);
         let batch = generate(&list, vec![rule(&["build"], &[], None, &[])]);
         assert_eq!(batch.add, vec![PathBuf::from("/build")]);
+    }
+
+    #[test]
+    fn deleted_path_returns_empty_batch() {
+        // A path reported by FSEvents may vanish before we walk it. The fast
+        // path (`fs::symlink_metadata` error) must return an empty batch
+        // before any ancestors `getxattr`, without erroring.
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let deleted = temp_dir.path().join("deleted-dir");
+        assert!(!deleted.exists());
+
+        let config = WalkConfig {
+            directories: vec![Directory {
+                path: temp_dir.path().to_path_buf(),
+                rules: vec![rule(&["entry"], &[], None, &[])],
+            }],
+            skips: HashSet::new(),
+        };
+        let batch = walk_non_recursive(&deleted, &config, false, &SkipCache::default());
+        assert!(batch.add.is_empty());
+        assert!(batch.remove.is_empty());
     }
 }
