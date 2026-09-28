@@ -1,0 +1,45 @@
+{
+  "outcome_axis_respected": true,
+  "findings": [
+    {
+      "defect_id": "novel-12",
+      "severity": "coverage",
+      "kind": "contradiction",
+      "location": "docs/tmexclude-iteration-plan.md D2 (line 31) + DoD-B (line 61) + R2 (line 73) + Complexity tier B (line 41) + Items WP-2 (line 102) + plan-model wp-2-b (title/scope/risk, lines 44-48)",
+      "evidence": "RESOLVED. The overflow policy is now single-choice bounded accumulation, coherent at all four-plus sites. D2: 'a single bounded pending set absorbs overflowing batches while in-flight count is at the cap — the set is a deduplicated path collection (MAX_PENDING_PATHS = 65536); an overflowing batch's paths merge into the set (dedup), and paths that would exceed the cap are dropped with warn! (bounded loss, by design). When in-flight count falls below the cap and the set is non-empty, the whole set is swapped out and processed as one normal batch (same dedup + ancestor-first ordering).' DoD-B tests exactly those three clauses (merge-with-dedup, cap-drop-with-warn, swap-out-below-cap) — falsifiable. R2's residual now matches the mechanism precisely: loss only where the cap forced drops or on crash/quit before drain, corrective = next event on the same directory or manual full scan. plan-model wp-2-b title/scope/risk use the same bounded-pending-set semantics with the same constant. Grep for replace|oldest-first|oldest first|silently dropped across docs/ matches only the reviewer's own round-2 findings file — zero stale wording remains in the artifact. Mechanism coherence re-checked: the cap has defined overflow behavior (not an open design point), and the drain trigger (in-flight falls below cap) drains at quiescence, so no starvation path exists.",
+      "suggestion": "None."
+    },
+    {
+      "defect_id": "novel-13",
+      "severity": "coverage",
+      "kind": "gap",
+      "location": "docs/tmexclude-iteration-plan.md D6 (line 35) + DoD-A (line 60) + plan-model wp-1-a.scope (line 30)",
+      "evidence": "RESOLVED. D6 now scopes spread-preservation to 'the two EDIT sites only (the excludes edit and the if-exists edit)' and states the type-switch site keeps its fresh default object, with rationale that matches the code reality (value is the Array-typed merge variant, nothing to preserve, spreading would produce junk numeric keys, toggle-back restores the full prior object via prev — RuleItem.tsx:59-71). DoD-A: 'spread-preserves at the two edit sites (the type-switch site keeps fresh defaults).' plan-model wp-1-a.scope synced identically.",
+      "suggestion": "None."
+    },
+    {
+      "defect_id": "novel-14",
+      "severity": "coverage",
+      "kind": "gap",
+      "location": "docs/tmexclude-iteration-plan.md Gate-2 (line 68)",
+      "evidence": "VERIFIED ADOPTED (round-2 non-blocking observation). Gate-2 now reads 'after a full scan and applying its result, dot-directories under ~/ (including ~/.cache) carry the exclusion xattr' — the apply step is no longer compressed away.",
+      "suggestion": "None."
+    },
+    {
+      "defect_id": "novel-15",
+      "severity": "coverage",
+      "kind": "gap",
+      "location": "spec-version 3 changed lines (D2, R2, DoD-B, Complexity tier B, Items WP-2, D6, DoD-A, Gate-2; plan-model wp-1-a/wp-2-b)",
+      "evidence": "NEW-DEFECT SCAN CLEAN. All changed lines were re-checked against the four defect kinds: no contradiction (D2/R2/DoD-B/tier/items/plan-model now state one mechanism), no gap (all new DoD clauses falsifiable; MAX_PENDING_PATHS has defined overflow behavior, so no open design point), no over-engineering (the 65536 cap bounds an existing mechanism, no speculative abstraction), no new blind spot (crash/quit-before-drain and cap-forced drops are both declared in R2 with accurate correctives). Non-finding nits below threshold: per-path warn! on cap-forced drops may be log-noisy under a sustained storm; wp-3-c plan-model risk retains the old 'full-scan backstop' shorthand (manual-only nuance is correctly stated in R1/R2 of the .md).",
+      "suggestion": "None."
+    },
+    {
+      "defect_id": "novel-16",
+      "severity": "coverage",
+      "kind": "gap",
+      "location": "report delivery",
+      "evidence": "Reviewer mandate is read-only (report, never edit/write). This round-3 findings JSON is delivered in the handback for the caller to persist at /Users/solosus/dev/ws-tools/tmexclude/docs/tmexclude-iteration-plan.findings.json (replacing the round-2 content).",
+      "suggestion": "Caller should write this JSON object to docs/tmexclude-iteration-plan.findings.json."
+    }
+  ]
+}
