@@ -14,3 +14,4 @@
 !.env.example
 !.env.solidforge.example
 .llm-provider.*.json
+.claude/parallel-dev/plan-queue-state.json
