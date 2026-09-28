@@ -1,6 +1,6 @@
 //! Utils and actors to walk directories recursively (or not) and perform `TimeMachine` operations on demand.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -193,6 +193,7 @@ pub fn walk_non_recursive(
     root: &Path,
     config: &WalkConfig,
     support_dump: bool,
+    no_include: bool,
     skip_cache: &Cache<PathBuf, ()>,
 ) -> ExclusionActionBatch {
     let check = check_f(support_dump);
@@ -214,14 +215,72 @@ pub fn walk_non_recursive(
         return ExclusionActionBatch::default();
     }
 
-    let mut directories = config
+    let directories: Vec<&Directory> = config
         .directories
         .iter()
         .filter(|directory| root.starts_with(&directory.path) || directory.path.starts_with(root))
-        .peekable();
-    if directories.peek().is_none() {
+        .collect();
+    if directories.is_empty() {
         // There's no need to scan because no rules is applicable.
         skip_cache.insert(root.to_path_buf(), ());
+        return ExclusionActionBatch::default();
+    }
+
+    // Read the entries first: the name prefilter below decides whether any
+    // real work (ancestors getxattr, per-entry checks) is needed at all.
+    let entries: Vec<(PathBuf, PathBuf, bool)> = match fs::read_dir(root) {
+        Ok(dir) => dir
+            .filter_map(|entry| {
+                entry
+                    .tap_err(|e| warn!("Error when scanning dir {:?}: {}", root, e))
+                    .ok()
+            })
+            .filter_map(|entry| {
+                let path = entry.path();
+                if config.skips.contains(&path) {
+                    // Skip this entry in all preceding procedures and scans.
+                    None
+                } else {
+                    let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    let name = PathBuf::from(path.file_name().expect("file name").to_os_string());
+                    Some((path, name, is_dir))
+                }
+            })
+            .collect(),
+        Err(e) => {
+            warn!("Error when scanning dir {:?}: {}", root, e);
+            return ExclusionActionBatch::default();
+        }
+    };
+
+    // Name prefilter (D3): the candidate sets are built from the same
+    // applicable rules `generate_diff` filters on. An Add action requires
+    // either an excludes-name match or a hidden-directory match, so a
+    // directory holding neither candidate can never produce an Add.
+    let candidate_rules: Vec<&Rule> = directories
+        .iter()
+        .flat_map(|directory| &directory.rules)
+        .collect();
+    let exclude_names: HashSet<&Path> = candidate_rules
+        .iter()
+        .flat_map(|rule| &rule.excludes)
+        .map(Path::new)
+        .collect();
+    let any_hidden = candidate_rules
+        .iter()
+        .any(|rule| rule.exclude_hidden == Some(true));
+
+    let has_exclude_candidate = entries
+        .iter()
+        .any(|(_, name, _)| exclude_names.contains(name.as_path()));
+    let has_hidden_candidate = any_hidden
+        && entries
+            .iter()
+            .any(|(_, name, is_dir)| *is_dir && is_hidden(name));
+    if no_include && !has_exclude_candidate && !has_hidden_candidate {
+        // No Add is possible and under `no_include` Removes are of no
+        // interest. The outcome is content-dependent, not config-deterministic:
+        // deliberately NOT inserted into the skip cache (D4).
         return ExclusionActionBatch::default();
     }
 
@@ -235,37 +294,35 @@ pub fn walk_non_recursive(
     }
 
     debug!("Walk through {:?}", root);
-    match fs::read_dir(root) {
-        Ok(dir) => {
-            let shallow_list: HashMap<_, _> = dir
-                .filter_map(|entry| {
-                    entry
-                        .tap_err(|e| warn!("Error when scanning dir {:?}: {}", root, e))
-                        .ok()
-                })
-                .filter_map(|entry| {
-                    let path = entry.path();
-                    if config.skips.contains(&path) {
-                        // Skip this entry in all preceding procedures and scans.
-                        None
-                    } else {
-                        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                        Some((
-                            PathBuf::from(path.file_name().expect("file name").to_os_string()),
-                            check(&path).ok()?,
-                            is_dir,
-                        ))
-                    }
-                })
-                .map(|(name, state, is_dir)| (name, ShallowEntry { state, is_dir }))
-                .collect();
-            generate_diff(root, &shallow_list, directories)
-        }
-        Err(e) => {
-            warn!("Error when scanning dir {:?}: {}", root, e);
-            ExclusionActionBatch::default()
-        }
-    }
+    let shallow_list: HashMap<_, _> = entries
+        .iter()
+        .filter_map(|(path, name, is_dir)| {
+            // Under `no_include`, real getxattr state is needed only for
+            // entries that could produce an action: excludes-name matches or
+            // hidden-match candidates. This precedence resolves the
+            // marker-and-exclude overlap toward the real state. Pure
+            // `if_exists` markers and `protects` entries enter the list with
+            // a dummy `Included` state - their presence is all
+            // `generate_diff` reads for them. Without `no_include`, every
+            // entry is real-checked (unchanged full semantics).
+            let needs_real_state = !no_include
+                || exclude_names.contains(name.as_path())
+                || (any_hidden && *is_dir && is_hidden(name));
+            let state = if needs_real_state {
+                check(path).ok()?
+            } else {
+                ExcludeState::Included
+            };
+            Some((
+                name.clone(),
+                ShallowEntry {
+                    state,
+                    is_dir: *is_dir,
+                },
+            ))
+        })
+        .collect();
+    generate_diff(root, &shallow_list, directories.iter().copied())
 }
 
 fn generate_diff<'a, 'b>(
@@ -315,6 +372,7 @@ fn generate_diff<'a, 'b>(
 #[cfg(test)]
 mod test {
     use std::collections::{HashMap, HashSet};
+    use std::fs;
     use std::path::{Path, PathBuf};
     use std::str::FromStr;
 
@@ -458,6 +516,16 @@ mod test {
         assert_eq!(batch.add, vec![PathBuf::from("/build")]);
     }
 
+    fn temp_walk_config(dir: &Path, rules: Vec<Rule>) -> WalkConfig {
+        WalkConfig {
+            directories: vec![Directory {
+                path: dir.to_path_buf(),
+                rules,
+            }],
+            skips: HashSet::new(),
+        }
+    }
+
     #[test]
     fn deleted_path_returns_empty_batch() {
         // A path reported by FSEvents may vanish before we walk it. The fast
@@ -467,15 +535,137 @@ mod test {
         let deleted = temp_dir.path().join("deleted-dir");
         assert!(!deleted.exists());
 
-        let config = WalkConfig {
-            directories: vec![Directory {
-                path: temp_dir.path().to_path_buf(),
-                rules: vec![rule(&["entry"], &[], None, &[])],
-            }],
-            skips: HashSet::new(),
-        };
-        let batch = walk_non_recursive(&deleted, &config, false, &SkipCache::default());
+        let config = temp_walk_config(temp_dir.path(), vec![rule(&["entry"], &[], None, &[])]);
+        let batch = walk_non_recursive(&deleted, &config, false, false, &SkipCache::default());
         assert!(batch.add.is_empty());
+        assert!(batch.remove.is_empty());
+    }
+
+    #[test]
+    fn prefilter_irrelevant_names_no_include_returns_empty_without_cache() {
+        // No entry name matches the applicable rules' `excludes` and there is
+        // no dot-directory: under `no_include` no Add is possible, so the walk
+        // must return an empty batch.
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        fs::create_dir(temp_dir.path().join("alpha")).unwrap();
+        fs::write(temp_dir.path().join("beta.txt"), b"data").unwrap();
+
+        let config = temp_walk_config(
+            temp_dir.path(),
+            vec![rule(&["node_modules"], &[], None, &[])],
+        );
+        let skip_cache = SkipCache::default();
+
+        let batch = walk_non_recursive(temp_dir.path(), &config, false, true, &skip_cache);
+        assert!(batch.add.is_empty());
+        assert!(batch.remove.is_empty());
+        // D4: the prefilter outcome is content-dependent, not
+        // config-deterministic, so it must NOT be cached.
+        assert!(skip_cache.get(temp_dir.path()).is_none());
+    }
+
+    #[test]
+    fn no_include_false_keeps_full_semantics_stale_exclusion_removed() {
+        // An entry irrelevant to the prefilter name sets but carrying a stale
+        // exclusion xattr must still produce a Remove when `no_include` is
+        // off: the prefilter must not alter the full-path semantics.
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let plain = temp_dir.path().join("plain");
+        fs::write(&plain, b"data").unwrap();
+        xattr::set(
+            &plain,
+            "com.apple.metadata:com_apple_backup_excludeItem",
+            b"",
+        )
+        .unwrap();
+
+        let config = temp_walk_config(temp_dir.path(), vec![rule(&["other"], &[], None, &[])]);
+        let batch = walk_non_recursive(
+            temp_dir.path(),
+            &config,
+            false,
+            false,
+            &SkipCache::default(),
+        );
+        assert_eq!(batch.remove, vec![plain]);
+        assert!(batch.add.is_empty());
+    }
+
+    #[test]
+    fn marker_and_exclude_overlap_gets_real_state_under_no_include() {
+        // `special` is both rule A's excludes-name match and rule B's
+        // `if_exists` marker; `.hidden` is hidden-matched gated by that
+        // marker. Under `no_include` both entries get real state and both
+        // Adds are produced (`special` must stay present in the shallow list
+        // for the marker gate to fire).
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        fs::create_dir(temp_dir.path().join("special")).unwrap();
+        fs::create_dir(temp_dir.path().join(".hidden")).unwrap();
+
+        let config = temp_walk_config(
+            temp_dir.path(),
+            vec![
+                rule(&["special"], &[], None, &[]),
+                rule(&[".hidden"], &["special"], Some(true), &[]),
+            ],
+        );
+        let batch =
+            walk_non_recursive(temp_dir.path(), &config, false, true, &SkipCache::default());
+        assert!(batch.remove.is_empty());
+        let mut adds = batch.add;
+        adds.sort();
+        assert_eq!(
+            adds,
+            vec![
+                temp_dir.path().join(".hidden"),
+                temp_dir.path().join("special"),
+            ]
+        );
+    }
+
+    #[test]
+    fn marker_and_exclude_overlap_stale_xattr_not_readded_under_no_include() {
+        // The excludes-name match takes precedence over the marker role: the
+        // overlapping entry gets REAL state, so a stale exclusion xattr is
+        // seen and the already-excluded entry is NOT re-Added.
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let special = temp_dir.path().join("special");
+        fs::create_dir(&special).unwrap();
+        xattr::set(
+            &special,
+            "com.apple.metadata:com_apple_backup_excludeItem",
+            b"",
+        )
+        .unwrap();
+        fs::create_dir(temp_dir.path().join(".hidden")).unwrap();
+
+        let config = temp_walk_config(
+            temp_dir.path(),
+            vec![
+                rule(&["special"], &[], None, &[]),
+                rule(&[".hidden"], &["special"], Some(true), &[]),
+            ],
+        );
+        let batch =
+            walk_non_recursive(temp_dir.path(), &config, false, true, &SkipCache::default());
+        assert_eq!(batch.add, vec![temp_dir.path().join(".hidden")]);
+        assert!(batch.remove.is_empty());
+    }
+
+    #[test]
+    fn hidden_rule_dot_dir_gets_real_state_siblings_skipped_under_no_include() {
+        // Under `no_include` with an `exclude_hidden` rule, the dot-directory
+        // is a hidden-match candidate (real state, Add produced) while plain
+        // siblings are skipped without real checks: the batch contains only
+        // the dot-dir Add.
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        fs::create_dir(temp_dir.path().join(".hidden")).unwrap();
+        fs::write(temp_dir.path().join("plain.txt"), b"data").unwrap();
+
+        let config = temp_walk_config(temp_dir.path(), vec![rule(&[], &[], Some(true), &[])]);
+        let batch =
+            walk_non_recursive(temp_dir.path(), &config, false, true, &SkipCache::default());
+        assert_eq!(batch.add, vec![temp_dir.path().join(".hidden")]);
         assert!(batch.remove.is_empty());
     }
 }

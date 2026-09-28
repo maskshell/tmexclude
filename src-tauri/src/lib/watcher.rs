@@ -185,7 +185,7 @@ fn process_batch(
     metrics: &Metrics,
 ) {
     for path in paths {
-        let mut batch = walk_non_recursive(path, walk_config, support_dump, cache);
+        let mut batch = walk_non_recursive(path, walk_config, support_dump, no_include, cache);
         if batch.is_empty() {
             continue;
         }
